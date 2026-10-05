@@ -1,0 +1,92 @@
+name: Build journey planner graph
+
+# Builds the OpenTripPlanner graph (street map + Transperth timetable) here, where there is
+# plenty of memory, and publishes it as the "otp-graph" release. The server only downloads it.
+# Building it on the server ran out of memory and left the journey planner on a timetable
+# that expired (found 5 Oct 2026).
+
+on:
+  schedule:
+    - cron: '0 19 * * 0,3'  # Monday and Thursday, 3am Perth time
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Must match OTP_VERSION in rabbit-loop-transit/otp/start.sh: a graph only loads in the version that built it.
+  OTP_VERSION: '2.5.0'
+  DATA: https://github.com/OVELLA9/rabbit-loop-transit-data/releases/download
+
+jobs:
+  build:
+    name: Build, test and publish the graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Download the street map, the timetable and OTP
+        run: |
+          mkdir otp && cd otp
+          curl -fL --retry 3 -o wa.osm.pbf "$DATA/osm-data/western-australia-latest.osm.pbf"
+          curl -fL --retry 3 -o gtfs.zip "$DATA/gtfs-data/gtfs.zip"
+          curl -fL --retry 3 -o otp.jar "https://github.com/opentripplanner/OpenTripPlanner/releases/download/v${OTP_VERSION}/otp-${OTP_VERSION}-shaded.jar"
+          ls -la
+          [ "$(wc -c < wa.osm.pbf)" -gt 100000000 ] || { echo "street map too small"; exit 1; }
+          [ "$(wc -c < gtfs.zip)" -gt 10000000 ] || { echo "timetable too small"; exit 1; }
+          # Same setting as rabbit-loop-transit/otp/build-config.json (stops two separate
+          # train lines being joined into one impossible leg). Keep the two in step.
+          echo '{ "gtfsDefaults": { "maxInterlineDistance": 0 } }' > build-config.json
+
+      - name: Build the graph
+        run: |
+          cd otp
+          java -Xmx12G -jar otp.jar --build --save .
+          ls -la graph.obj
+          [ "$(wc -c < graph.obj)" -gt 50000000 ] || { echo "graph too small"; exit 1; }
+          rm -f wa.osm.pbf gtfs.zip
+
+      - name: Test it the way the server runs it (1 GB of memory)
+        run: |
+          cd otp
+          java -Xmx1G -jar otp.jar --load . > server.log 2>&1 &
+          PID=$!
+          for i in $(seq 1 60); do
+            curl -fs http://localhost:8080/otp/routers/default > router.json && break
+            kill -0 $PID 2>/dev/null || { echo "OTP stopped while loading the graph"; tail -40 server.log; exit 1; }
+            sleep 5
+          done
+          [ -s router.json ] || { echo "OTP never came up"; tail -40 server.log; exit 1; }
+          python3 - <<'PY'
+          import json, time, urllib.request, datetime, sys
+          r = json.load(open('router.json'))
+          ends = r['transitServiceEnds']
+          ends = ends / 1000 if ends > 1e11 else ends
+          days = (ends - time.time()) / 86400
+          print('timetable runs for another %.0f days' % days)
+          if days < 14:
+              sys.exit('the timetable in this graph ends too soon')
+          # a real trip tomorrow at 8am Perth time: Perth Station to Perth Zoo
+          perth = datetime.datetime.utcnow() + datetime.timedelta(hours=8, days=1)
+          url = ('http://localhost:8080/otp/routers/default/plan?fromPlace=-31.9514167,115.860458&toPlace=-31.9759741,115.8537056'
+                 '&date=%s&time=08:00:00&mode=TRANSIT,WALK&numItineraries=3' % perth.strftime('%Y-%m-%d'))
+          plan = json.load(urllib.request.urlopen(url, timeout=120))
+          n = len((plan.get('plan') or {}).get('itineraries') or [])
+          print('test trip tomorrow 8am: %d journeys' % n)
+          if n < 1:
+              sys.exit('the test trip found no journeys')
+          PY
+          kill $PID
+
+      - name: Publish the graph
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create otp-graph --repo "$GITHUB_REPOSITORY" --title "Journey planner graph" \
+            --notes "Auto-built street map + timetable for the journey planner (OTP ${OTP_VERSION})" || true
+          gh release upload otp-graph otp/graph.obj --repo "$GITHUB_REPOSITORY" --clobber
